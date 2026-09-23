@@ -1,0 +1,123 @@
+:root {
+  --fg: #33ff33;
+  --fg-dim: #1f9e1f;
+  --fg-bright: #b6ffb6;
+  --bg: #020a02;
+  --glow: 0 0 4px rgba(51, 255, 51, 0.45);
+  --font: "VT323", "Consolas", "Menlo", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 22px;
+  line-height: 1.25;
+  text-shadow: var(--glow);
+}
+
+/* CRT scanlines: purely decorative, never intercepts clicks */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.15) 0 1px,
+    transparent 1px 3px
+  );
+}
+
+#screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 12px 16px;
+}
+
+#header {
+  color: var(--bg);
+  background: var(--fg);
+  text-shadow: none;
+  padding: 0 8px;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#terminal {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-top: 8px;
+}
+
+#output .line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-height: 1.25em;
+}
+#output .echo   { color: var(--fg-dim); }
+#output .dim    { color: var(--fg-dim); }
+#output .bright { color: var(--fg-bright); }
+#output .err    { color: var(--fg-bright); }
+
+#prompt-line {
+  display: flex;
+  gap: 0.5ch;
+}
+.ps1 { color: var(--fg-bright); }
+
+.field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+/* The mirror shows the typed text plus a block cursor; the real input sits on top, invisible */
+#mirror {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+#cmd {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  font: inherit;
+  text-shadow: none;
+}
+
+.cursor {
+  background: var(--fg);
+  color: var(--bg);
+  text-shadow: none;
+  animation: blink 1s steps(1) infinite;
+}
+.field:not(:focus-within) .cursor {
+  animation: none;
+  background: transparent;
+  color: var(--fg);
+  outline: 1px solid var(--fg-dim);
+}
+
+@keyframes blink {
+  50% { background: transparent; color: var(--fg); }
+}
+
+@media (max-width: 600px) {
+  html, body { font-size: 18px; }
+}
