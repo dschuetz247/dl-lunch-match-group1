@@ -32,12 +32,45 @@
     return { day: today(), nextId: 1, groups: [] };
   }
 
-  // Loads today's data; anything from an earlier day is discarded and removed from storage.
+  /* Lunch slots: a group runs from its start time to start + SLOT_MINUTES */
+
+  var SLOT_MINUTES = 45;
+
+  function toMinutes(time) {
+    return Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
+  }
+  function nowMinutes() {
+    var d = new Date();
+    return d.getHours() * 60 + d.getMinutes();
+  }
+  // Slots ending after midnight (e.g. 23:30 -> 24:15 minutes) never count as over within the day
+  function isOver(time) {
+    return toMinutes(time) + SLOT_MINUTES <= nowMinutes();
+  }
+  function slotEnd(time) {
+    var end = toMinutes(time) + SLOT_MINUTES;
+    return pad2(Math.floor(end / 60) % 24) + ":" + pad2(end % 60);
+  }
+
+  // Gap-free IDs: groups are kept in creation order, so an ID is just the position + 1
+  function renumber(data) {
+    data.groups.forEach(function (g, i) { g.id = i + 1; });
+    data.nextId = data.groups.length + 1;
+  }
+
+  // Loads today's data; anything from an earlier day is discarded and removed from storage,
+  // and groups whose slot has ended are dropped silently (renumbering the rest).
   function load() {
     var data = null;
     try { data = JSON.parse(storageGet(DATA_KEY)); } catch (e) { data = null; }
     if (!data || data.day !== today() || !Array.isArray(data.groups)) {
       data = freshData();
+      save(data);
+    }
+    var running = data.groups.filter(function (g) { return !isOver(g.time); });
+    if (running.length !== data.groups.length) {
+      data.groups = running;
+      renumber(data);
       save(data);
     }
     return data;
@@ -73,21 +106,23 @@
     return null;
   }
 
-  // Removes user from group, deleting the group when it becomes empty. Returns whether it was deleted.
+  // Removes user from group, deleting the group when it becomes empty and renumbering the rest.
+  // The deleted group object keeps its old ID, so messages can still name it.
   function removeMember(data, group, user) {
     group.members = group.members.filter(function (m) { return m !== user; });
-    if (group.members.length === 0) {
-      data.groups = data.groups.filter(function (g) { return g.id !== group.id; });
-      return true;
-    }
-    return false;
+    if (group.members.length) return { deleted: false, renumbered: false };
+    var index = data.groups.indexOf(group);
+    data.groups.splice(index, 1);
+    renumber(data);
+    return { deleted: true, renumbered: index < data.groups.length };
   }
 
   // One group per user: leaves the current group (if any) before creating or joining another.
   function leaveCurrent(data, user) {
     var current = groupOf(data, user);
     if (!current) return null;
-    return { group: current, deleted: removeMember(data, current, user) };
+    var result = removeMember(data, current, user);
+    return { group: current, deleted: result.deleted, renumbered: result.renumbered };
   }
 
   function requireUser(user) {
@@ -98,10 +133,12 @@
   var store = {
     today: today,
     validateTime: validateTime,
+    slotEnd: slotEnd,
 
     createGroup: function (user, time, food, place) {
       user = requireUser(user);
       validateTime(time);
+      if (isOver(time)) throw new Error("that time slot is already over (" + time + "-" + slotEnd(time) + ")");
       food = String(food || "").trim();
       place = String(place || "").trim();
       if (!food) throw new Error("food must not be empty");
@@ -141,9 +178,9 @@
         if (!group) throw new Error("group #" + id + " not found");
         if (group.members.indexOf(user) === -1) throw new Error("you are not in group #" + id);
       }
-      var deleted = removeMember(data, group, user);
+      var result = removeMember(data, group, user);
       save(data);
-      return { group: group, deleted: deleted };
+      return { group: group, deleted: result.deleted, renumbered: result.renumbered };
     },
 
     // filters: { food, with, from, to } - all optional, combined with AND
@@ -199,22 +236,14 @@
 
   /* Typewriter output: print() queues lines, a rAF loop types them at ~CHAR_MS per character */
 
-  var CHAR_MS = 2;
-  var TYPING_KEY = "lunchmatch.typing";
+  var CHAR_MS = 4;
   var queue = [];        // lines waiting to be typed: { el, text }; el joins the DOM when its typing starts
   var typedChars = 0;    // characters of queue[0] already written
   var lastFrame = 0;
   var frameRequested = false;
 
-  function typingSaved() {
-    var value = storageGet(TYPING_KEY);
-    return value === "on" || value === "off" ? value : null;
-  }
-
-  // Saved choice wins; without one, typing is on unless the system asks for reduced motion
+  // Not user-switchable: only a system request for reduced motion turns typing off
   function typingEnabled() {
-    var saved = typingSaved();
-    if (saved) return saved === "on";
     return !(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   }
 
@@ -228,7 +257,7 @@
     terminalEl.scrollTop = terminalEl.scrollHeight;
   }
 
-  // Instant output, used for the user's own echo and when typing is off
+  // Instant output, used for the user's own echo and with reduced motion
   function printNow(text, cls) {
     var line = createLine(cls);
     line.textContent = text;
@@ -302,8 +331,16 @@
     mirrorEl.appendChild(document.createTextNode(value.slice(pos + 1)));
   }
 
+  function slot(group) {
+    return group.time + "-" + store.slotEnd(group.time);
+  }
+
   function describe(group) {
-    return "#" + group.id + " (" + group.time + " " + group.food + " @ " + group.place + ")";
+    return "#" + group.id + " (" + slot(group) + " " + group.food + " @ " + group.place + ")";
+  }
+
+  function printRenumbered(result) {
+    if (result && result.renumbered) print("groups renumbered", "dim");
   }
 
   function people(n) {
@@ -313,6 +350,7 @@
   function printLeft(left) {
     if (!left) return;
     print("left " + describe(left.group) + (left.deleted ? " -- group empty -> deleted" : ""), "dim");
+    printRenumbered(left);
   }
 
   function parseId(raw) {
@@ -427,7 +465,7 @@
         if (!groups.length) { print("no groups found"); return; }
 
         var rows = [["ID", "TIME", "FOOD", "PLACE", "WHO"]].concat(groups.map(function (g) {
-          return [String(g.id), g.time, g.food, g.place, g.members.join(", ")];
+          return [String(g.id), slot(g), g.food, g.place, g.members.join(", ")];
         }));
         var widths = [0, 0, 0, 0];
         rows.forEach(function (r) {
@@ -476,6 +514,7 @@
         if (args.length > 1) throw new UsageError("too many arguments");
         var result = store.leaveGroup(user, args.length ? parseId(args[0]) : null);
         print("left " + describe(result.group) + (result.deleted ? " -- group empty -> deleted" : ""));
+        printRenumbered(result);
       }
     },
 
@@ -486,26 +525,18 @@
       run: function () {
         cancel();
         outputEl.textContent = "";
-      }
-    },
-
-    typing: {
-      usage: "typing [on|off]",
-      description: "turn the typewriter effect on or off",
-      example: "typing off",
-      run: function (args) {
-        if (args.length > 1) throw new UsageError("too many arguments");
-        if (!args.length) {
-          print("typing: " + (typingEnabled() ? "on" : "off") + (typingSaved() ? "" : " (default)"));
-          return;
-        }
-        var value = args[0].toLowerCase();
-        if (value !== "on" && value !== "off") throw new UsageError("expected 'on' or 'off'");
-        storageSet(TYPING_KEY, value);
-        print("typing " + value);
+        printWelcome();
       }
     }
   };
+
+  function printWelcome() {
+    var user = store.getUser();
+    var count = store.listGroups().length;
+    print("LUNCHMATCH/OS " + VERSION + " - type 'help'", "bright");
+    print((user ? "Hello " + user + ". " : "run 'login <name>' to start. ") +
+      count + (count === 1 ? " group" : " groups") + " today.", "dim");
+  }
 
   function execute(line) {
     var tokens = tokenize(line);
@@ -575,11 +606,7 @@
   });
 
   renderHeader();
-  print("LUNCHMATCH/OS " + VERSION + " - type 'help'", "bright");
-  var user = store.getUser();
-  var count = store.listGroups().length;
-  print((user ? "welcome back, " + user + ". " : "run 'login <name>' to start. ") +
-    count + (count === 1 ? " group" : " groups") + " today.", "dim");
+  printWelcome();
   renderMirror();
   inputEl.focus();
 })();
