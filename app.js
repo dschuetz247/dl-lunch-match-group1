@@ -197,11 +197,90 @@
   var history = [];
   var historyIndex = 0;
 
-  function print(text, cls) {
+  /* Typewriter output: print() queues lines, a rAF loop types them at ~CHAR_MS per character */
+
+  var CHAR_MS = 2;
+  var TYPING_KEY = "lunchmatch.typing";
+  var queue = [];        // lines waiting to be typed: { el, text }; el joins the DOM when its typing starts
+  var typedChars = 0;    // characters of queue[0] already written
+  var lastFrame = 0;
+  var frameRequested = false;
+
+  function typingSaved() {
+    var value = storageGet(TYPING_KEY);
+    return value === "on" || value === "off" ? value : null;
+  }
+
+  // Saved choice wins; without one, typing is on unless the system asks for reduced motion
+  function typingEnabled() {
+    var saved = typingSaved();
+    if (saved) return saved === "on";
+    return !(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  }
+
+  function createLine(cls) {
     var line = document.createElement("div");
     line.className = "line" + (cls ? " " + cls : "");
+    return line;
+  }
+
+  function scrollToBottom() {
+    terminalEl.scrollTop = terminalEl.scrollHeight;
+  }
+
+  // Instant output, used for the user's own echo and when typing is off
+  function printNow(text, cls) {
+    var line = createLine(cls);
     line.textContent = text;
     outputEl.appendChild(line);
+  }
+
+  function print(text, cls) {
+    if (!typingEnabled()) { printNow(text, cls); return; }
+    queue.push({ el: createLine(cls), text: String(text) });
+    if (!frameRequested) {
+      frameRequested = true;
+      lastFrame = performance.now();
+      requestAnimationFrame(typeFrame);
+    }
+  }
+
+  function typeFrame(now) {
+    frameRequested = false;
+    var budget = Math.floor((now - lastFrame) / CHAR_MS);
+    lastFrame += budget * CHAR_MS;
+    while (queue.length) {
+      var head = queue[0];
+      if (!head.el.parentNode) outputEl.appendChild(head.el);
+      var take = Math.min(budget, head.text.length - typedChars);
+      typedChars += take;
+      budget -= take;
+      head.el.textContent = head.text.slice(0, typedChars);
+      if (typedChars < head.text.length) break;
+      queue.shift();
+      typedChars = 0;
+    }
+    scrollToBottom();
+    if (queue.length) {
+      frameRequested = true;
+      requestAnimationFrame(typeFrame);
+    }
+  }
+
+  // Writes all pending output at once
+  function flush() {
+    queue.forEach(function (item) {
+      if (!item.el.parentNode) outputEl.appendChild(item.el);
+      item.el.textContent = item.text;
+    });
+    cancel();
+    scrollToBottom();
+  }
+
+  // Drops pending output without writing it
+  function cancel() {
+    queue = [];
+    typedChars = 0;
   }
 
   function renderHeader() {
@@ -405,7 +484,25 @@
       description: "clear the screen",
       example: "clear",
       run: function () {
+        cancel();
         outputEl.textContent = "";
+      }
+    },
+
+    typing: {
+      usage: "typing [on|off]",
+      description: "turn the typewriter effect on or off",
+      example: "typing off",
+      run: function (args) {
+        if (args.length > 1) throw new UsageError("too many arguments");
+        if (!args.length) {
+          print("typing: " + (typingEnabled() ? "on" : "off") + (typingSaved() ? "" : " (default)"));
+          return;
+        }
+        var value = args[0].toLowerCase();
+        if (value !== "on" && value !== "off") throw new UsageError("expected 'on' or 'off'");
+        storageSet(TYPING_KEY, value);
+        print("typing " + value);
       }
     }
   };
@@ -434,16 +531,25 @@
     var line = inputEl.value;
     inputEl.value = "";
     if (line.trim()) {
-      print("> " + line, "echo");
+      printNow("> " + line, "echo");
       history.push(line);
       execute(line);
     } else {
-      print(">", "echo");
+      printNow(">", "echo");
     }
     historyIndex = history.length;
     renderMirror();
-    terminalEl.scrollTop = terminalEl.scrollHeight;
+    scrollToBottom();
   }
+
+  // Any key finishes pending output; capture phase so it runs before Enter submits, and the key still reaches the input
+  document.addEventListener("keydown", function () {
+    if (queue.length) flush();
+  }, true);
+  // Paste and on-screen keyboards change the input without a keydown
+  inputEl.addEventListener("input", function () {
+    if (queue.length) flush();
+  });
 
   inputEl.addEventListener("keydown", function (e) {
     if (e.key === "Enter") {
