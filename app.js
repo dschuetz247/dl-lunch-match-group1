@@ -83,6 +83,37 @@
     return String(name).trim().toLowerCase();
   }
 
+  /* User names: long names are cut to NAME_BASE characters, plus a 01-99 suffix on collisions */
+
+  var NAMES_KEY = "lunchmatch.names";   // { "<full name>": "<short name>" }, kept across days
+  var NAME_BASE = 20;
+
+  function loadNames() {
+    try { return JSON.parse(storageGet(NAMES_KEY)) || {}; } catch (e) { return {}; }
+  }
+
+  // Resolves a typed name to its (at most 22-character) user name. With claim, a new
+  // long name takes the lowest free short name and is remembered for next time.
+  function resolveName(input, claim) {
+    var name = normalizeName(input);
+    if (name.length <= NAME_BASE) return name;
+    var names = loadNames();
+    if (names[name]) return names[name];
+    var base = name.slice(0, NAME_BASE);
+    if (!claim) return base;
+
+    var taken = {};
+    Object.keys(names).forEach(function (full) { taken[names[full]] = true; });
+    var short = base;
+    for (var n = 1; taken[short]; n++) {
+      if (n > 99) throw new Error("too many users named " + base + "...");
+      short = base + pad2(n);
+    }
+    names[name] = short;
+    storageSet(NAMES_KEY, JSON.stringify(names));
+    return short;
+  }
+
   function validateTime(time) {
     if (!TIME_FORMAT.test(time)) {
       throw new Error("invalid time '" + time + "': expected HH:MM (24h), e.g. 12:15");
@@ -192,7 +223,7 @@
         }
       });
       var food = filters.food != null ? String(filters.food).toLowerCase() : null;
-      var member = filters["with"] != null ? normalizeName(filters["with"]) : null;
+      var member = filters["with"] != null ? resolveName(filters["with"], false) : null;
 
       return load().groups
         .filter(function (g) {
@@ -208,6 +239,7 @@
       return user ? groupOf(load(), normalizeName(user)) : null;
     },
 
+    resolveName: resolveName,
     getUser: function () { return storageGet(USER_KEY); },
     setUser: function (name) {
       if (name) storageSet(USER_KEY, normalizeName(name));
@@ -225,7 +257,8 @@
   var VERSION = "v0.1";
   var DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-  var headerEl = document.getElementById("header");
+  var headerSysEl = document.getElementById("header-sys");
+  var headerUserEl = document.getElementById("header-user");
   var terminalEl = document.getElementById("terminal");
   var outputEl = document.getElementById("output");
   var inputEl = document.getElementById("cmd");
@@ -237,10 +270,44 @@
   /* Typewriter output: print() queues lines, a rAF loop types them at ~CHAR_MS per character */
 
   var CHAR_MS = 4;
+  var LOAD_MIN_MS = 250;   // "disk load" pause before each block of output
+  var LOAD_MAX_MS = 450;
   var queue = [];        // lines waiting to be typed: { el, text }; el joins the DOM when its typing starts
   var typedChars = 0;    // characters of queue[0] already written
   var lastFrame = 0;
+  var holdUntil = 0;     // nothing is typed before this time (the disk-load pause)
   var frameRequested = false;
+
+  function random(min, max) {
+    return min + Math.random() * (max - min);
+  }
+
+  /* Floppy drive activity light: flickers at random while output is pending */
+
+  var driveLedEl = document.getElementById("drive-led");
+  var driveTimer = null;
+  var driveActive = false;
+
+  // Mostly short flashes, now and then a longer one, like a drive reading several sectors
+  function driveStep() {
+    var lit = driveLedEl.classList.toggle("on");
+    var delay = lit
+      ? (Math.random() < 0.2 ? random(120, 260) : random(15, 70))
+      : (Math.random() < 0.15 ? random(90, 200) : random(10, 60));
+    driveTimer = setTimeout(driveStep, delay);
+  }
+
+  function setDriveActive(active) {
+    if (active === driveActive) return;
+    driveActive = active;
+    if (active) {
+      driveStep();
+    } else {
+      clearTimeout(driveTimer);
+      driveTimer = null;
+      driveLedEl.classList.remove("on");
+    }
+  }
 
   // Not user-switchable: only a system request for reduced motion turns typing off
   function typingEnabled() {
@@ -255,7 +322,63 @@
 
   function scrollToBottom() {
     terminalEl.scrollTop = terminalEl.scrollHeight;
+    renderScrollbar();
   }
+
+  /* Vintage scrollbar: #terminal scrolls natively (its own bar hidden), #scrollbar mirrors it */
+
+  var scrollbarEl = document.getElementById("scrollbar");
+  var thumbEl = document.getElementById("thumb");
+  var THUMB_INSET = 2;
+  var THUMB_MIN = 16;
+
+  function thumbGeometry() {
+    var track = scrollbarEl.clientHeight - 2 * THUMB_INSET;
+    var height = Math.max(THUMB_MIN, track * terminalEl.clientHeight / terminalEl.scrollHeight);
+    return { track: track, height: height, travel: Math.max(0, track - height) };
+  }
+
+  function renderScrollbar() {
+    var range = terminalEl.scrollHeight - terminalEl.clientHeight;
+    var overflowing = range > 1;
+    scrollbarEl.classList.toggle("visible", overflowing);
+    if (!overflowing) return;
+    var g = thumbGeometry();
+    thumbEl.style.height = g.height + "px";
+    thumbEl.style.top = (THUMB_INSET + g.travel * terminalEl.scrollTop / range) + "px";
+  }
+
+  function lineHeight() {
+    return parseFloat(getComputedStyle(terminalEl).lineHeight) || 20;
+  }
+
+  // One page = the visible height minus one line, so a line of context stays in view
+  function scrollPage(direction) {
+    terminalEl.scrollTop += direction * (terminalEl.clientHeight - lineHeight());
+  }
+
+  terminalEl.addEventListener("scroll", renderScrollbar);
+  window.addEventListener("resize", renderScrollbar);
+
+  // mousedown is prevented so the prompt keeps focus
+  scrollbarEl.addEventListener("mousedown", function (e) {
+    e.preventDefault();
+    if (e.target === thumbEl) {
+      var startY = e.clientY;
+      var startTop = terminalEl.scrollTop;
+      var g = thumbGeometry();
+      var ratio = (terminalEl.scrollHeight - terminalEl.clientHeight) / Math.max(1, g.travel);
+      var onMove = function (ev) { terminalEl.scrollTop = startTop + (ev.clientY - startY) * ratio; };
+      var onUp = function () {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    } else {
+      scrollPage(e.clientY < thumbEl.getBoundingClientRect().top ? -1 : 1);
+    }
+  });
 
   // Instant output, used for the user's own echo and with reduced motion
   function printNow(text, cls) {
@@ -266,6 +389,11 @@
 
   function print(text, cls) {
     if (!typingEnabled()) { printNow(text, cls); return; }
+    if (!queue.length) {
+      // First line of a new block: "load it from disk" before typing starts
+      holdUntil = performance.now() + random(LOAD_MIN_MS, LOAD_MAX_MS);
+      setDriveActive(true);
+    }
     queue.push({ el: createLine(cls), text: String(text) });
     if (!frameRequested) {
       frameRequested = true;
@@ -276,6 +404,13 @@
 
   function typeFrame(now) {
     frameRequested = false;
+    if (queue.length && now < holdUntil) {
+      // Still "loading": type nothing yet, and start counting characters only after the pause
+      lastFrame = now;
+      frameRequested = true;
+      requestAnimationFrame(typeFrame);
+      return;
+    }
     var budget = Math.floor((now - lastFrame) / CHAR_MS);
     lastFrame += budget * CHAR_MS;
     while (queue.length) {
@@ -293,6 +428,8 @@
     if (queue.length) {
       frameRequested = true;
       requestAnimationFrame(typeFrame);
+    } else {
+      setDriveActive(false);
     }
   }
 
@@ -310,12 +447,17 @@
   function cancel() {
     queue = [];
     typedChars = 0;
+    holdUntil = 0;
+    setDriveActive(false);
+    renderScrollbar();
   }
 
   function renderHeader() {
     var user = store.getUser();
     var date = DAYS[new Date().getDay()] + " " + today();
-    headerEl.textContent = "LUNCHMATCH/OS " + VERSION + "  |  " + date + "  |  user: " + (user || "(not logged in)");
+    // Split so the user can move to its own line on narrow screens (see style.css)
+    headerSysEl.textContent = "LUNCHMATCH/OS " + VERSION + "  |  " + date;
+    headerUserEl.textContent = "user: " + (user || "(not logged in)");
   }
 
   // Keeps the visible text + block cursor in sync with the (invisible) real input
@@ -415,6 +557,9 @@
           print("  " + c.usage);
           print("      " + c.description + "  --  e.g. " + c.example, "dim");
         });
+        print("keys:", "bright");
+        print("  PgUp / PgDn");
+        print("      scroll the output one page up / down", "dim");
       }
     },
 
@@ -424,9 +569,10 @@
       example: "login anna",
       run: function (args) {
         if (args.length !== 1) throw new UsageError(args.length ? "name must be a single word" : "missing name");
-        store.setUser(args[0]);
+        var name = store.resolveName(args[0], true);
+        store.setUser(name);
         renderHeader();
-        print("logged in as " + store.getUser(), "bright");
+        print("logged in as " + name + (name !== args[0].toLowerCase() ? " (name shortened)" : ""), "bright");
       }
     },
 
@@ -586,6 +732,10 @@
     if (e.key === "Enter") {
       e.preventDefault();
       submit();
+    } else if (e.key === "PageUp" || e.key === "PageDown") {
+      // Scrolls the output only; the prompt's text and cursor stay as they are
+      e.preventDefault();
+      scrollPage(e.key === "PageUp" ? -1 : 1);
     } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
       e.preventDefault();
       if (!history.length) return;
